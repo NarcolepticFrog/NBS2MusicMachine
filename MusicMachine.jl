@@ -1,8 +1,9 @@
-"Path to keybind mod's macro folder."
-const BASE_DIR = "MINECRAFT_HOME/liteconfig/common/macros/"
-
 using DataStructures
 import Base.Order.ForwardOrdering
+
+###################
+### NBS Parsing ###
+###################
 
 type NBSHeader
     length::Int
@@ -47,6 +48,7 @@ function read(io::IO, ::Type{NBSHeader})
     header
 end
 
+"Reads a length-prefixed string."
 function read_string(io::IO)
     length = read(io, Int32)
     chars = Array{Char}(length)
@@ -56,7 +58,7 @@ function read_string(io::IO)
     String(chars)
 end
 
-@enum NBSInstrument nbs_piano=0 nbs_double_bass=1 nbs_bass_drum=2 nbs_snare_drum=3 nbs_click=4
+@enum NBSInstrument nbs_piano=0 nbs_double_bass=1 nbs_bass_drum=2 nbs_snare_drum=3 nbs_click=4 nbs_guitar=5 nbs_flute=6 nbs_bell=7 nbs_chime=8 nbs_xylophone=9
 
 type NBSNote
     position::Int
@@ -109,12 +111,11 @@ end
 
 const NBSSound = Tuple{NBSInstrument, Int}
 
-
-@enum MCItemType mc_stackable mc_unstackable
-
 ##################
 ### ItemStream ###
 ##################
+
+@enum MCItemType mc_stackable mc_unstackable
 
 "Represents a sequence of stackable and non-stackable items."
 type ItemList
