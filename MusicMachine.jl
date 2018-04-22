@@ -67,6 +67,7 @@ type NBSNote
     key::Int
 end
 
+"Reads the notes for an NBS song from `io`."
 function read_notes(io::IO)
     notes = Array{NBSNote}(0)
     tick = -1
@@ -109,6 +110,7 @@ function readNBS(path::String)
     song
 end
 
+"An `NBSSound` is an `NBSIntrument` together with the `key` it is played at."
 const NBSSound = Tuple{NBSInstrument, Int}
 
 ##################
@@ -231,7 +233,7 @@ end
 
 done(si::StackIterator, pos) = pos > si.il.num_items
 
-eltyle(si::StackIterator) = Tuple{MCItemType, Int}
+eltype(si::StackIterator) = Tuple{MCItemType, Int}
 
 length(si::StackIterator) = num_stacks(si.il)
 
@@ -251,15 +253,46 @@ function get_chest_prefix(il::ItemList, chest_size=27)::Int
 end
 
 """
+Searches for a location to split the item list that will not skip any unstackable
+items. `chest_size` is the inventory size, `skip` is the number of items skipped
+on a split, and `max_backtrack` is the maximum number of items we are willing
+to backtrack on.
+"""
+function get_best_split(il::ItemList, chest_size=27, skip=2, max_backtrack=20)
+    "Computes the number of unstackable items skipped when splitting at `ix`."
+    function split_cost(ix)
+        cost = 0
+        for i in ix+1:ix+skip
+            if i in il.unstackable_positions
+                cost += 1
+            end
+        end
+        cost
+    end
+    chest_prefix = get_chest_prefix(il, chest_size)
+    split_ix = chest_prefix
+    cost = split_cost(split_ix)
+    for ix in split_ix:-1:split_ix-max_backtrack
+        ix_cost = split_cost(ix)
+        if ix_cost < cost
+            split_ix = ix
+            cost = ix_cost
+        end
+    end
+    return split_ix
+end
+
+"""
 Splits an `ItemList` into sub-lists that fit into a single chest. After each
 split, `skip` (by default `skip=2`) items are omitted in the next chest (this is
 to account for the fact that rotating chests in the current machine takes 8
 redstone ticks).
 """
-function split_item_list(il::ItemList, chest_size=27; skip=2)
+function split_item_list(il::ItemList, chest_size=27; skip=2, max_backtrack=10)
     chests = Array{ItemList}(0)
     while num_stacks(il) > chest_size
-        split_point = get_chest_prefix(il, chest_size)
+        #split_point = get_chest_prefix(il, chest_size)
+        split_point = get_best_split(il, chest_size, skip, max_backtrack)
         first_chest, il = split_at(il, split_point; skip=skip)
         push!(chests, first_chest)
     end
@@ -267,185 +300,119 @@ function split_item_list(il::ItemList, chest_size=27; skip=2)
     chests
 end
 
+#############################################
+### Utilities for Programming The Machine ###
+#############################################
+
 """
-Returns `true` if none of the `ItemStreams` have any unstackable items in positions
-`ix+1`, ..., `ix+skip`.
+Given an `ItemList` and coordinates `(x,y,z)`, returns a setblock minecraft
+command that will create a chest
 """
-function safe_split(ils, ix; skip=2)
-    for il in values(ils)
-        for j in 1:skip
-            if ix+j in il.unstackable_positions
-                return false
-            end
-        end
-    end
-    return true
-end
-
-function split_cost(ils, ix; skip=2)
-    cost = 0
-    for il in values(ils)
-        for j in 1:skip
-            if ix+j in il.unstackable_positions
-                cost += 1
-            end
-        end
-    end
-    cost
-end
-
-function split_item_lists(ils::Dict{NBSSound, ItemList}, chest_size=27)
-    ils = copy(ils)
-    chests = Dict{NBSSound, Vector{ItemList}}()
-    for sound in keys(ils)
-        chests[sound] = Array{ItemList}(0)
-    end
-    done = false
-    while !done
-        done = true
-        split_point = typemax(Int)
-        for (sound, il) in ils
-            if num_stacks(il) > chest_size
-                done = false
-                il_split = get_chest_prefix(il, chest_size)
-                split_point = min(split_point, il_split)
-            end
-        end
-
-        if !done
-            best_cost = Inf
-            best_split = 0
-            for split in split_point - 10:split_point
-                cost = split_cost(ils, split)
-                if cost <= best_cost
-                    best_cost = cost
-                    best_split = split
+function make_chest(il::ItemList, x, y, z)
+    shulker_boxes = split_item_list(il)
+    command = "setblock $(x) $(y) $(z) minecraft:chest 0 replace {Items:["
+    for (ix,sb) in enumerate(shulker_boxes)
+        command *= "{id:\"minecraft:white_shulker_box\",Slot:$(ix-1)b,Count:1b,tag:{BlockEntityTag:{Items:["
+        st = 0
+        slot = 0
+        last_type = mc_stackable
+        for (item_type, stack_size) in StackIterator(sb)
+            if item_type == mc_stackable
+                if last_type == mc_unstackable
+                    st += 1
                 end
+                command *= "{Slot:$(slot),id:\"minecraft:wool\",Count:$(stack_size)b,Damage:$(st)},"
+            elseif item_type == mc_unstackable
+                command *= "{Slot:$(slot),id:\"minecraft:stone_shovel\",Count:1b},"
             end
-            if best_split != split_point
-                println("Adjusted split saved $(split_cost(ils, split_point) - best_cost) notes!")
-            end
-            for (sound, il) in ils
-                chest, ils[sound] = split_at(il, best_split)
-                push!(chests[sound], chest)
-            end
+            last_type = item_type
+            slot += 1
         end
-
+        command *= "]}}},"
     end
-    chests
+    command *= "]}"
+    command
 end
 
-###########################################
-### Utilities for Programming Minecarts ###
-###########################################
-
-function make_shulker_string(il::ItemList)
-    st = 0
-    slot = 0
-    last_type = mc_stackable
-    parts = ["give @p minecraft:white_shulker_box 1 0 {BlockEntityTag:{Items:["]
-    for (item_type, stack_size) in StackIterator(il)
-        if item_type == mc_stackable
-            if last_type == mc_unstackable
-                st += 1
-            end
-            push!(parts, "{Slot:$(slot),id:\"minecraft:wool\",Count:$(stack_size)b,Damage:$(st)},")
-        elseif item_type == mc_unstackable
-            push!(parts,"{Slot:$(slot),id:\"minecraft:stone_shovel\",Count:1b},")
-        end
-        last_type = item_type
-        slot += 1
-    end
-    push!(parts, "]}}")
-    string(parts...)
+"Returns the input memory chest for the `ix`th module offset by `generator` ticks."
+function get_input_chest_location(ix)
+    (x,y,z) = get_noteblock_location(ix)
+    (x-6, y+3, z+3)
 end
 
-"Deletes the macro files for filling chests."
-function clear_chest_macros()
-    for i in 1:24
-        chest_path = joinpath(BASE_DIR, "chest$i.txt")
-        if isfile(chest_path)
-            rm(chest_path)
-        end
-    end
+"Returns the output memory chest for the `ix`th module offset by `generator` ticks."
+function get_output_chest_location(ix, facing = [1,0,0])
+    (x,y,z) = get_noteblock_location(ix)
+    (x-6, y-3, z)
 end
 
-"""
-Creates a macro in `BASE_DIR` that clears the users inventory, then fills it with the
-items in the `ItemList` `il`. The stackable items are different colors of wool, which
-limits the number of distinct stackable item types to 16.
-"""
-function save_macro(name::String, il::ItemList)
-    fh = open(joinpath(BASE_DIR, "$(name).txt"), "w")
-    st = 0
-    last_type = mc_stackable
-    println(fh, "/clear")
-    println(fh, "\$\${WAIT(2t)}\$\$")
-    for i in 1:9
-        println(fh, "/give @p diamond_sword")
-    end
-    for (item_type, stack_size) in StackIterator(il)
-        if item_type == mc_stackable
-            if last_type == mc_unstackable
-                st += 1
-            end
-            println(fh, "/give @p wool $(stack_size) $(st)")
-        elseif item_type == mc_unstackable
-            println(fh, "/give @p stone_shovel")
+"Returns the note block for the `ix`th module offset by `generator` ticks."
+function get_noteblock_location(ix)
+    z = (ix-1)%10
+    y = div(ix-1,10)
+    (-926, 14+7y, -1004 + 4z)
+end
+
+"Returns the instrument block for the `ix`th module offset by `generator` ticks."
+function get_instrument_location(ix)
+    (x,y,z) = get_noteblock_location(ix)
+    return (x,y-1,z)
+end
+
+function get_repeter_location(ix)
+    (x,y,z) = get_noteblock_location(ix)
+    return (x-9, y+1, z+2)
+end
+
+function make_mcfunction(song::NBSSong, outfile)
+    instrument_blocks = [
+        "minecraft:air",
+        "minecraft:planks",
+        "minecraft:stone",
+        "minecraft:sand",
+        "minecraft:glass",
+        "minecraft:wool",
+        "minecraft:clay",
+        "minecraft:gold_block",
+        "minecraft:packed_ice",
+        "minecraft:bone_block"
+    ]
+    command = ""
+    ix = 1
+    for generator in 0:3
+        item_lists = get_item_lists(song;modulus=4, generator=generator)
+        for ((instrument, key), il) in item_lists
+            # Place the instrument block
+            (x,y,z) = get_instrument_location(ix)
+            block_type = instrument_blocks[Int(instrument)+1]
+            command *= "setblock $(x) $(y) $(z) $(block_type)\n"
+
+            # Set the noteblock key
+            (x,y,z) = get_noteblock_location(ix)
+            command *= "setblock $(x) $(y) $(z) minecraft:air 0 replace\n"
+            command *= "setblock $(x) $(y) $(z) minecraft:noteblock 0 replace {note:$(key-33)b}\n"
+
+            # Set the input chest
+            (x,y,z) = get_input_chest_location(ix)
+            command *= "setblock $(x) $(y) $(z) minecraft:air 0 replace\n"
+            command *= make_chest(il, x, y, z) * "\n"
+
+            # Set output chest
+            (x,y,z) = get_output_chest_location(ix)
+            command *= "setblock $(x) $(y) $(z) minecraft:air 0 replace\n"
+            command *= "setblock $(x) $(y) $(z) minecraft:chest 0 replace\n"
+
+            # Set repeater delay
+            (x,y,z) = get_repeter_location(ix)
+            command *= "setblock $(x) $(y) $(z) minecraft:air 0 replace\n"
+            command *= "setblock $(x) $(y) $(z) minecraft:unpowered_repeater $(1+4*generator) replace\n"
+
+            ix += 1
         end
-        last_type = item_type
     end
+    @show ix
+    fh = open(outfile, "w")
+    print(fh, command)
     close(fh)
-end
-
-"""
-This function takes an `NBSSong` and a tick-length and interactively walks the user
-through programming the music machine. It writes macros to `BASE_DIR` that can be used
-for efficiently filling each column of chests, as well as for scheduling the chest
-rotations.
-"""
-function interactive_song_program(song::NBSSong, last_pos = Inf)
-    block_type = ["air", "wood", "stone", "sand", "glass"]
-    for tick_offset in 0:3
-        println("\n\nTICK OFFSET = $(tick_offset)\n\n")
-
-        ils = get_item_lists(song; last_pos=last_pos, modulus=4, generator=tick_offset)
-        sounds = sort(collect(keys(ils)))
-
-        for i in 1:12:length(sounds)
-            println("BANK $(div(i-1,12)):")
-
-            bank_ils = Dict{NBSSound, ItemList}()
-            for j in 1:min(i+11, length(sounds))
-                bank_ils[sounds[j]] = ils[sounds[j]]
-            end
-
-            chests = split_item_lists(bank_ils)
-
-            rotation_times = ItemList()
-            push!(rotation_times.unstackable_positions, 1)
-            pos = 1
-            for c in first(values(chests))[1:end-1]
-                pos += c.num_items+2
-                push!(rotation_times.unstackable_positions, pos)
-                rotation_times.num_items = pos
-            end
-            save_macro("rotation", rotation_times)
-
-            for j in i:min(i+11, length(sounds))
-                println(" SOUND: ", block_type[Int(sounds[j][1])+1],":",sounds[j][2]-33, " ")
-            end
-
-            for j in i:min(i+11, length(sounds))
-                clear_chest_macros()
-                println("Column $(j-i+1)")
-                for (k,c) in enumerate(chests[sounds[j]])
-                    println("  Chest $k: ", show_items(c))
-                    save_macro("chest$k", c)
-                end
-                readline()
-            end
-        end
-
-    end
+    return command
 end
